@@ -1,0 +1,27 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  id          Int      @id @default(autoincrement())     // @id: 기본키 지정, @default(autoincrement()): 자동증가
+  name        String   @db.VarChar(100)                  // @db.VarChar(100): PostgreSQL VARCHAR(100) 타입
+  description String?  @db.Text                          // String?: NULL 허용, @db.Text: PostgreSQL TEXT 타입
+  price       Decimal  @db.Decimal(10, 2)               // @db.Decimal(10,2): PostgreSQL DECIMAL(10,2) - 정밀도10, 소수점2자리
+  stock       Int      @default(0)                       // @default(0): 기본값 0으로 설정
+  version     Int      @default(1)                       // 낙관적 락용 버전 필드, 초기값 1
+  createAt    DateTime @default(now()) @map("created_at") // @default(now()): 레코드 생성시 현재시간 자동설정, @map(): DB컬럼명 매핑
+  updateAt    DateTime @updatedAt @map("updated_at")      // @updatedAt: 레코드 수정시마다 현재시간 자동업데이트
+
+  @@map("products") // @@map(): 모델명 Product를 DB 테이블명 products로 매핑
+}
