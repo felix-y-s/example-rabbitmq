@@ -32,20 +32,49 @@ export class InventoryRepository extends BaseRepository {
     return await this.prismaService.product.create({ data });
   }
 
-  async healthCheck(): Promise<{ database: string, timestamp: string }> {
-    try {
-      await this.prismaService.$queryRaw`SELECT 1`;
+  async reduceStockWithLock(productId: number, quantity: number) {
+    return await this.prismaService.$transaction(async (prisma) => {
+      const products = await prisma.$queryRaw<
+        Array<{
+          id: number;
+          stock: number;
+          version: number;
+        }>
+      >(
+        Prisma.sql`
+          SELECT id, stock, version
+          FROM products
+          WHERE id = ${productId}
+          FOR UPDATE`,
+      );
+
+      if (products.length === 0) {
+        return { success: false, message: '상품을 찾을 수 없습니다.' };
+      }
+
+      const product = products[0];
+
+      if (product.stock < quantity) {
+        return {
+          success: false,
+          message: `재고 부족 (현재: ${product.stock}, 요청: ${quantity})`,
+        };
+      }
+
+      // 재고 업데이트
+      const updateProduct = await prisma.product.update({
+        where: { id: productId },
+        data: {
+          stock: product.stock - quantity,
+          version: { increment: 1 },
+        },
+      });
 
       return {
-        database: 'connected',
-        timestamp: new Date().toISOString(),
+        success: true,
+        message: '재고 감소 완료 (비관적 락)',
+        finalStock: updateProduct.stock,
       };
-    } catch (error) {
-      this.logger.error('데이터베이스 연결 실패', error);
-      return {
-        database: 'disconnected',
-        timestamp: new Date().toISOString(),
-      };
-    }
+    });
   }
 }

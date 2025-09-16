@@ -1,4 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+} from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { InventoryRepository } from '../database/inventory.repository';
 
@@ -81,6 +85,32 @@ export class InventoryService {
       success: false,
       message: '알 수 없는 오류로 처리 실패',
     };
+  }
+
+  async reduceStockPessimistic(
+    productId: number,
+    quantity: number,
+    maxRetries: number = 3,
+  ) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.inventoryRepository.reduceStockWithLock(
+          productId,
+          quantity,
+        );
+      } catch (error) {
+        if (attempt < maxRetries) {
+          await this.sleep(Math.random() * 50 + 100);
+          this.logger.debug(`재시도 ${attempt}/${maxRetries}`);
+          continue;
+        }
+
+        return {
+          success: false,
+          message: `재고 감소 시도 최종 실패 (productId:${productId})`,
+        };
+      }
+    }
   }
 
   async sleep(ms: number) {
