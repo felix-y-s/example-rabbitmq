@@ -18,79 +18,150 @@ T4    |                  | UPDATE stock=-1  | -1 ❌
 
 ## 🔧 해결책 비교
 
-### 1. 낙관적 락 (Optimistic Locking)
-```typescript
-// Version 기반 낙관적 락
-@Entity()
-export class Product {
-  @PrimaryGeneratedColumn()
-  id: number;
-  
-  @Column()
-  stock: number;
-  
-  @VersionColumn() // 자동 버전 관리
-  version: number;
-}
+### 1. 낙관적 락 (Optimistic Locking) - Prisma 구현
 
-// 서비스 로직
-async reduceStock(productId: number, quantity: number) {
-  const maxRetries = 3;
-  
-  for (let i = 0; i < maxRetries; i++) {
+```prisma
+// Prisma 스키마 (schema.prisma)
+model Product {
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(100)
+  description String?  @db.Text
+  price       Decimal  @db.Decimal(10, 2)
+  stock       Int      @default(0)
+  version     Int      @default(1)  // 낙관적 락용 버전 필드
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("products")
+}
+```
+
+```typescript
+// 서비스 로직 - Prisma 낙관적 락 구현
+async reduceStockOptimistic(
+  productId: number,
+  quantity: number,
+  maxRetries: number = 3,
+): Promise<{ success: boolean; message: string; finalStock?: number }> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const product = await this.productRepo.findOne({
-        where: { id: productId }
+      // 현재 상품 조회 (버전 포함)
+      const currentProduct = await this.prisma.product.findUnique({
+        where: { id: productId },
       });
-      
-      if (product.stock < quantity) {
-        throw new Error('재고 부족');
+
+      if (!currentProduct) {
+        return { success: false, message: '상품을 찾을 수 없습니다.' };
       }
-      
-      product.stock -= quantity;
-      await this.productRepo.save(product); // 버전 체크 자동
-      return true;
-      
+
+      if (currentProduct.stock < quantity) {
+        return {
+          success: false,
+          message: `재고 부족 (현재: ${currentProduct.stock}, 요청: ${quantity})`,
+        };
+      }
+
+      // Prisma 낙관적 락 업데이트
+      const updatedProduct = await this.prisma.product.update({
+        where: {
+          id: productId,
+          version: currentProduct.version, // 🔑 낙관적 락 조건
+        },
+        data: {
+          stock: currentProduct.stock - quantity,
+          version: { increment: 1 }, // 🔄 버전 자동 증가
+        },
+      });
+
+      return {
+        success: true,
+        message: '재고 감소 완료',
+        finalStock: updatedProduct.stock,
+      };
+
     } catch (error) {
-      if (error.name === 'OptimisticLockVersionMismatchError') {
-        // 재시도
-        continue;
+      // Prisma 낙관적 락 충돌 감지
+      if (error instanceof Prisma.PrismaClientKnownRequestError) {
+        if (error.code === 'P2025') {
+          // Record not found - 버전 충돌 (다른 트랜잭션이 먼저 수정함)
+          if (attempt < maxRetries) {
+            await this.sleep(Math.random() * 50 + 10); // 백오프
+            continue;
+          }
+        }
       }
       throw error;
     }
   }
-  
-  throw new Error('동시성 충돌로 실패');
+
+  return { success: false, message: '동시성 충돌로 재고 감소 실패' };
+}
+
+private async sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 ```
 
-**장점**: 성능이 좋음, 대부분 상황에서 효율적  
-**단점**: 재시도 로직 복잡, 충돌 빈발 시 성능 저하
+**장점**:
+- 성능이 좋음, 대부분 상황에서 효율적
+- **TypeORM보다 안정적**: 명시적 버전 체크로 확실한 충돌 감지
+- **P2025 에러 코드**: 버전 충돌을 정확히 식별 가능
 
-### 2. 비관적 락 (Pessimistic Locking)
+**단점**: 재시도 로직 필요, 충돌 빈발 시 성능 저하
+
+### 2. 비관적 락 (Pessimistic Locking) - Prisma 구현
+
 ```typescript
-async reduceStockWithLock(productId: number, quantity: number) {
-  return await this.dataSource.transaction(async manager => {
-    // FOR UPDATE로 행 락 획득
-    const product = await manager.findOne(Product, {
-      where: { id: productId },
-      lock: { mode: 'pessimistic_write' }
-    });
-    
-    if (product.stock < quantity) {
-      throw new Error('재고 부족');
+async reduceStockWithLock(
+  productId: number,
+  quantity: number
+): Promise<{ success: boolean; message: string; finalStock?: number }> {
+  return await this.prisma.$transaction(async (prisma) => {
+    // Prisma Raw Query로 FOR UPDATE 락 획득
+    const products = await prisma.$queryRaw<Array<{
+      id: number;
+      stock: number;
+      version: number;
+    }>>`
+      SELECT id, stock, version
+      FROM products
+      WHERE id = ${productId}
+      FOR UPDATE
+    `;
+
+    if (products.length === 0) {
+      return { success: false, message: '상품을 찾을 수 없습니다.' };
     }
-    
-    product.stock -= quantity;
-    await manager.save(product);
-    
-    return true;
+
+    const product = products[0];
+
+    if (product.stock < quantity) {
+      return {
+        success: false,
+        message: `재고 부족 (현재: ${product.stock}, 요청: ${quantity})`,
+      };
+    }
+
+    // 재고 업데이트
+    const updatedProduct = await prisma.product.update({
+      where: { id: productId },
+      data: {
+        stock: product.stock - quantity,
+        version: { increment: 1 },
+      },
+    });
+
+    return {
+      success: true,
+      message: '재고 감소 완료 (비관적 락)',
+      finalStock: updatedProduct.stock,
+    };
   });
 }
 ```
 
-**장점**: 확실한 동시성 제어, 로직 단순  
-**단점**: 성능 저하, 데드락 가능성
+**장점**: 확실한 동시성 제어, 로직 단순, 데이터 일관성 보장
+**단점**: 성능 저하, 데드락 가능성, 트랜잭션 대기 시간 증가
 
 ### 3. Redis 분산 락
 ```typescript
@@ -112,17 +183,22 @@ async reduceStockWithRedisLock(productId: number, quantity: number) {
   }
   
   try {
-    // 재고 처리 로직
-    const product = await this.productRepo.findOne({
+    // Prisma로 재고 처리 로직
+    const product = await this.prisma.product.findUnique({
       where: { id: productId }
     });
-    
-    if (product.stock < quantity) {
+
+    if (!product || product.stock < quantity) {
       throw new Error('재고 부족');
     }
-    
-    product.stock -= quantity;
-    await this.productRepo.save(product);
+
+    await this.prisma.product.update({
+      where: { id: productId },
+      data: {
+        stock: product.stock - quantity,
+        version: { increment: 1 },
+      },
+    });
     
     return true;
     
@@ -157,31 +233,37 @@ async handleStockReduction(message: StockReductionMessage) {
   const { productId, quantity, orderId } = message;
   
   try {
-    // 단일 컨슈머이므로 동시성 문제 없음
-    const product = await this.productRepo.findOne({
+    // 단일 컨슈머이므로 동시성 문제 없음 - Prisma 구현
+    const product = await this.prisma.product.findUnique({
       where: { id: productId }
     });
-    
-    if (product.stock < quantity) {
+
+    if (!product || product.stock < quantity) {
       // 재고 부족 이벤트 발행
       await this.rabbitMQ.publish('inventory', 'stock.insufficient', {
         orderId,
         productId,
         requestedQuantity: quantity,
-        availableStock: product.stock
+        availableStock: product?.stock || 0
       });
       return;
     }
-    
-    product.stock -= quantity;
-    await this.productRepo.save(product);
+
+    // Prisma로 재고 업데이트
+    const updatedProduct = await this.prisma.product.update({
+      where: { id: productId },
+      data: {
+        stock: product.stock - quantity,
+        version: { increment: 1 },
+      },
+    });
     
     // 재고 차감 성공 이벤트 발행
     await this.rabbitMQ.publish('inventory', 'stock.reduced', {
       orderId,
       productId,
       quantity,
-      remainingStock: product.stock
+      remainingStock: updatedProduct.stock
     });
     
   } catch (error) {
@@ -211,32 +293,73 @@ async handleStockReduction(message: StockReductionMessage) {
 - **완벽한 순서 보장**: 메시지 큐 순차 처리
 - **금융/결제**: 비관적 락 (확실성 우선)
 
-### 하이브리드 접근
+### 하이브리드 접근 - Prisma 구현
 ```typescript
-async smartStockReduction(productId: number, quantity: number) {
-  // 1차: 낙관적 락 시도
+async smartStockReduction(
+  productId: number,
+  quantity: number
+): Promise<{ success: boolean; message: string; method: string; finalStock?: number }> {
+
+  // 1차: 낙관적 락 시도 (가장 빠름)
   try {
-    return await this.optimisticReduction(productId, quantity);
-  } catch (OptimisticLockError) {
-    
-    // 2차: Redis 락으로 재시도
-    try {
-      return await this.redisLockReduction(productId, quantity);
-    } catch (RedisLockError) {
-      
-      // 3차: 메시지 큐로 비동기 처리
-      await this.queueStockReduction(productId, quantity);
-      return { status: 'queued' };
+    const result = await this.reduceStockOptimistic(productId, quantity, 2);
+    if (result.success) {
+      return { ...result, method: 'optimistic' };
+    }
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2025') {
+      // 낙관적 락 충돌 - 다음 단계로
+    } else {
+      throw error;
     }
   }
+
+  // 2차: Redis 분산 락으로 재시도 (중간 수준)
+  try {
+    const result = await this.reduceStockWithRedisLock(productId, quantity);
+    if (result.success) {
+      return { ...result, method: 'redis_lock' };
+    }
+  } catch (error) {
+    // Redis 락 실패 - 마지막 단계로
+  }
+
+  // 3차: 메시지 큐로 비동기 처리 (확실함)
+  await this.queueStockReduction(productId, quantity);
+  return {
+    success: true,
+    message: '비동기 처리 대기열에 추가됨',
+    method: 'message_queue'
+  };
+}
+
+// Prisma 특화 에러 처리 도우미
+private isPrismaOptimisticLockError(error: any): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError &&
+         error.code === 'P2025';
 }
 ```
 
 ## 🧪 다음 단계: 실습 준비
 
-어떤 방식부터 실제 코드로 구현해보시겠습니까?
+현재 프로젝트에서 이미 **Prisma 낙관적 락이 구현**되어 있습니다!
 
-1. **낙관적 락 + TypeORM**: 가장 실무에서 많이 사용
-2. **Redis 분산 락**: 분산 환경 필수 기술
-3. **RabbitMQ 순차 처리**: 메시지 큐 핵심 패턴
-4. **성능 테스트**: 동시 요청 부하 테스트
+### ✅ 이미 구현된 기능
+1. **Prisma 낙관적 락**: `inventory.service.ts`에서 `reduceStockOptimistic()` 구현
+2. **에러 처리**: `P2025` 코드로 버전 충돌 감지
+3. **재시도 로직**: 백오프 알고리즘 적용
+
+### 🚀 추가 구현 가능한 기능
+1. **비관적 락**: `$queryRaw`로 `FOR UPDATE` 구현
+2. **Redis 분산 락**: 분산 환경 대응
+3. **RabbitMQ 순차 처리**: 메시지 큐 패턴
+4. **하이브리드 접근**: 3단계 폴백 전략
+5. **성능 테스트**: 동시 요청 부하 테스트
+
+### 🎯 권장 다음 단계
+- **성능 테스트**: 현재 낙관적 락 성능 측정
+- **Redis 락 추가**: 높은 동시성 환경 대응
+- **모니터링 추가**: 충돌률 및 재시도 횟수 로깅
+
+어떤 기능을 추가로 구현해보시겠습니까?
