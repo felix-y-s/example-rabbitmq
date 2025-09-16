@@ -6,6 +6,6 @@ import { InventoryRepository } from './inventory.repository';
 @Module({
   imports: [PrismaModule],
   providers: [InventoryRepository],
-  exports: [InventoryRepository]
+  exports: [InventoryRepository],
 })
 export class DatabaseModule {}

@@ -1,9 +1,5 @@
-import {
-  Injectable,
-  InternalServerErrorException,
-  Logger,
-} from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Injectable, Logger } from '@nestjs/common';
+import { Prisma, Product } from '@prisma/client';
 import { InventoryRepository } from '../database/inventory.repository';
 
 @Injectable()
@@ -107,7 +103,7 @@ export class InventoryService {
 
         return {
           success: false,
-          message: `재고 감소 시도 최종 실패 (productId:${productId})`,
+          message: `재고 감소 시도 최종 실패 (productId:${productId}): ${error}`,
         };
       }
     }
@@ -129,7 +125,7 @@ export class InventoryService {
     name: string,
     price: number,
     initialStock: number,
-  ): Promise<any> {
+  ): Promise<Product> {
     return await this.inventoryRepository.create({
       name,
       price,

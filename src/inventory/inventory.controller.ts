@@ -8,7 +8,7 @@ import {
   Param,
   Post,
 } from '@nestjs/common';
-import { InventoryService } from './ inventory.service';
+import { InventoryService } from './inventory.service';
 import { ReduceStockDto } from './dto/reduce-stock.dto';
 import { CreateProductDto } from './dto/create-product.dto';
 
@@ -200,7 +200,9 @@ export class InventoryController {
   async testConcurrentReductionPessimistic(
     @Body() body: { productId: number; quantity: number; requestCount: number },
   ) {
-    this.logger.log(`동시성 테스트 시작(비관적 락) - ${body.requestCount}개 요청`);
+    this.logger.log(
+      `동시성 테스트 시작(비관적 락) - ${body.requestCount}개 요청`,
+    );
 
     const { productId, quantity, requestCount } = body;
     const startTime = Date.now();
@@ -224,7 +226,7 @@ export class InventoryController {
     const endTime = Date.now();
 
     const successCount = results.filter((r) => {
-      if ('result' in r && r.result.success) return true;
+      if ('result' in r && r.result?.success) return true;
       else return false;
     }).length;
 

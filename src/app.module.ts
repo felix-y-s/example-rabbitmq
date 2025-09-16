@@ -3,7 +3,6 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { InventoryModule } from './inventory/inventory.module';
 import { ConfigModule } from '@nestjs/config';
-import { PrismaModule } from 'nestjs-prisma';
 import { DatabaseModule } from './database/database.module';
 
 @Module({

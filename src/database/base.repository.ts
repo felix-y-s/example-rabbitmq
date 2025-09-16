@@ -1,5 +1,4 @@
 import { Logger } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
 import { PrismaService } from 'nestjs-prisma';
 
 export abstract class BaseRepository {
