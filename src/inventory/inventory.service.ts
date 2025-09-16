@@ -1,12 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { PrismaService } from 'nestjs-prisma';
-import { Prisma } from '@prisma/client';
+import { Prisma, Product } from '@prisma/client';
+import { InventoryRepository } from '../database/inventory.repository';
 
 @Injectable()
 export class InventoryService {
   private readonly logger = new Logger(InventoryService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly inventoryRepository: InventoryRepository) {}
 
   // 🎯 Prisma 기반 낙관적 락 재고 감소
   async reduceStockOptimistic(
@@ -21,9 +21,8 @@ export class InventoryService {
         );
 
         // 현재 상품 조회 (버전 포함)
-        const currentProduct = await this.prisma.product.findUnique({
-          where: { id: productId },
-        });
+        const currentProduct =
+          await this.inventoryRepository.findInventoryById(productId);
 
         if (!currentProduct) {
           return { success: false, message: '상품을 찾을 수 없습니다.' };
@@ -37,16 +36,13 @@ export class InventoryService {
         }
 
         // Prisma 낙관적 락 업데이트
-        const updatedProduct = await this.prisma.product.update({
-          where: {
-            id: productId,
-            version: currentProduct.version, // 낙관적 락 조건
-          },
-          data: {
+        const updatedProduct = await this.inventoryRepository.updateProduct(
+          productId,
+          {
             stock: currentProduct.stock - quantity,
             version: { increment: 1 }, // 버전 자동 증가
           },
-        });
+        );
 
         this.logger.log(`재고 감소 성공 - 남은 재고: ${updatedProduct.stock}`);
 
@@ -87,15 +83,39 @@ export class InventoryService {
     };
   }
 
+  async reduceStockPessimistic(
+    productId: number,
+    quantity: number,
+    maxRetries: number = 3,
+  ) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.inventoryRepository.reduceStockWithLock(
+          productId,
+          quantity,
+        );
+      } catch (error) {
+        if (attempt < maxRetries) {
+          await this.sleep(Math.random() * 50 + 100);
+          this.logger.debug(`재시도 ${attempt}/${maxRetries}`);
+          continue;
+        }
+
+        return {
+          success: false,
+          message: `재고 감소 시도 최종 실패 (productId:${productId}): ${error}`,
+        };
+      }
+    }
+  }
+
   async sleep(ms: number) {
     await new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   // 재고 조회
   async getStock(productId: number): Promise<number | null> {
-    const product = await this.prisma.product.findUnique({
-      where: { id: productId },
-    });
+    const product = await this.inventoryRepository.findInventoryById(productId);
 
     return product?.stock ?? null;
   }
@@ -105,30 +125,15 @@ export class InventoryService {
     name: string,
     price: number,
     initialStock: number,
-  ): Promise<any> {
-    return this.prisma.product.create({
-      data: {
-        name,
-        price,
-        stock: initialStock,
-      },
+  ): Promise<Product> {
+    return await this.inventoryRepository.create({
+      name,
+      price,
+      stock: initialStock,
     });
   }
 
-  async healthCheck(): Promise<{ database: string; timestamp: string }> {
-    try {
-      await this.prisma.$queryRaw`SELECT 1`;
-
-      return {
-        database: 'connected',
-        timestamp: new Date().toISOString(),
-      };
-    } catch (error) {
-      this.logger.error('데이터베이스 연결 실패', error);
-      return {
-        database: 'disconnected',
-        timestamp: new Date().toISOString(),
-      };
-    }
+  async healthCheck() {
+    return await this.inventoryRepository.healthCheck();
   }
 }

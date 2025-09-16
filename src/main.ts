@@ -34,4 +34,4 @@ async function bootstrap() {
   logger.log(`🗄️ 데이터베이스: ${configService.get('database.host')}:
   ${configService.get('database.port')}`);
 }
-bootstrap();
+bootstrap().catch((error) => console.log('부트스트랩 시작 실패:', error));

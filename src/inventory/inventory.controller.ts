@@ -8,7 +8,7 @@ import {
   Param,
   Post,
 } from '@nestjs/common';
-import { InventoryService } from './ inventory.service';
+import { InventoryService } from './inventory.service';
 import { ReduceStockDto } from './dto/reduce-stock.dto';
 import { CreateProductDto } from './dto/create-product.dto';
 
@@ -64,6 +64,20 @@ export class InventoryController {
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }
+  }
+
+  @Post('reduce-stock-pessimistic')
+  async reduceStockPessimistic(@Body() reduceStockDto: ReduceStockDto) {
+    this.logger.log(
+      `재고 감소 요청(비관적 락): ${JSON.stringify(reduceStockDto)}`,
+    );
+
+    const result = await this.inventoryService.reduceStockPessimistic(
+      reduceStockDto.productId,
+      reduceStockDto.quantity,
+    );
+
+    return result;
   }
 
   @Get('stock/:productId')
@@ -166,6 +180,53 @@ export class InventoryController {
 
     const successCount = results.filter((r) => {
       if ('result' in r && r.result.success) return true;
+      else return false;
+    }).length;
+
+    return {
+      statusCode: HttpStatus.OK,
+      message: '동시성 테스트 완료',
+      data: {
+        successfulReductions: successCount,
+        executionTimeMs: endTime - startTime,
+        results: results.slice(0, 15),
+      },
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // 동시성 테스트용 엔트포인트
+  @Post('test/concurrent-reduce-pessimistic')
+  async testConcurrentReductionPessimistic(
+    @Body() body: { productId: number; quantity: number; requestCount: number },
+  ) {
+    this.logger.log(
+      `동시성 테스트 시작(비관적 락) - ${body.requestCount}개 요청`,
+    );
+
+    const { productId, quantity, requestCount } = body;
+    const startTime = Date.now();
+
+    // 동시에 여러 요청 실행
+    const promises = Array.from({ length: requestCount }, (_, index) => {
+      this.logger.log(`요청 ${index} 시작 - ${new Date().toISOString()}`);
+      return this.inventoryService
+        .reduceStockPessimistic(productId, quantity)
+        .then((result) => {
+          this.logger.log(`요청 ${index} 완료 - ${new Date().toISOString()}`);
+          return { index, result };
+        })
+        .catch((error: Error) => {
+          this.logger.error(`요청 ${index} 에러 - ${new Date().toISOString()}`);
+          return { index, error: error.message };
+        });
+    });
+
+    const results = await Promise.all(promises);
+    const endTime = Date.now();
+
+    const successCount = results.filter((r) => {
+      if ('result' in r && r.result?.success) return true;
       else return false;
     }).length;
 
