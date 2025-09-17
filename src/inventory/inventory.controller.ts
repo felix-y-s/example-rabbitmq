@@ -100,6 +100,31 @@ export class InventoryController {
     return result;
   }
 
+  @Post('reduce-stock-redis-lock')
+  async reduceStockWithRedisLock(@Body() reduceStockDto: ReduceStockDto) {
+    this.logger.log(
+      `재고 감소 요청(Redis 분산락): ${JSON.stringify(reduceStockDto)}`,
+    );
+
+    const result = await this.inventoryService.reduceStockWithRedisLock(
+      reduceStockDto.productId,
+      reduceStockDto.quantity,
+    );
+
+    return {
+      statusCode: result.success ? HttpStatus.OK : HttpStatus.BAD_REQUEST,
+      message: result.message,
+      data: result.success
+        ? {
+            productId: reduceStockDto.productId,
+            reduceQuantity: reduceStockDto.quantity,
+            remainingStock: result.finalStock,
+          }
+        : null,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
   @Get('stock/:productId')
   async getStock(@Param('productId') productId: number) {
     try {
