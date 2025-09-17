@@ -11,11 +11,15 @@ import {
 import { InventoryService } from './inventory.service';
 import { ReduceStockDto } from './dto/reduce-stock.dto';
 import { CreateProductDto } from './dto/create-product.dto';
+import { RedisService } from '@liaoliaots/nestjs-redis';
 
 @Controller('inventory')
 export class InventoryController {
   private readonly logger = new Logger(InventoryController.name);
-  constructor(private readonly inventoryService: InventoryService) {}
+  constructor(
+    private readonly inventoryService: InventoryService,
+    private readonly redisService: RedisService,
+  ) {}
 
   @Post('reduce-stock')
   async reduceStock(@Body() reduceStockDto: ReduceStockDto) {
@@ -37,6 +41,12 @@ export class InventoryController {
           HttpStatus.BAD_REQUEST,
         );
       }
+
+      // 재고 감소 성공 시 캐시 무효화
+      const redis = this.redisService.getOrThrow('cache');
+      const cacheKey = `stock:${reduceStockDto.productId}`;
+      await redis.del(cacheKey);
+      this.logger.log(`재고 캐시 무효화: ${reduceStockDto.productId}`);
 
       return {
         statusCode: HttpStatus.OK,
@@ -77,12 +87,40 @@ export class InventoryController {
       reduceStockDto.quantity,
     );
 
+    // 재고 감소 성공 시 캐시 무효화
+    if (result && result.success) {
+      const redis = this.redisService.getOrThrow('cache');
+      const cacheKey = `stock:${reduceStockDto.productId}`;
+      await redis.del(cacheKey);
+      this.logger.log(
+        `재고 캐시 무효화(비관적 락): ${reduceStockDto.productId}`,
+      );
+    }
+
     return result;
   }
 
   @Get('stock/:productId')
   async getStock(@Param('productId') productId: number) {
     try {
+      const redis = this.redisService.getOrThrow('cache');
+      const cacheKey = `stock:${productId}`;
+
+      // 캐시에서 먼저 조회
+      const cachedStock = await redis.get(cacheKey);
+      if (cachedStock !== null) {
+        this.logger.log(`캐시에서 재고 조회: ${productId}`);
+        return {
+          statusCode: HttpStatus.OK,
+          data: {
+            productId,
+            stock: parseInt(cachedStock),
+          },
+          timestamp: new Date().toISOString(),
+        };
+      }
+
+      // 캐시에 없으면 DB에서 조회
       const stock = await this.inventoryService.getStock(productId);
 
       if (stock === null) {
@@ -95,6 +133,11 @@ export class InventoryController {
           HttpStatus.NOT_FOUND,
         );
       }
+
+      // 조회 결과를 캐시에 저장 (5분 TTL)
+      await redis.setex(cacheKey, 300, stock.toString());
+      this.logger.log(`재고 정보 캐시 저장: ${productId} = ${stock}`);
+
       return {
         statusCode: HttpStatus.OK,
         data: {
