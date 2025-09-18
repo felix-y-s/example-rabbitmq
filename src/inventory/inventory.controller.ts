@@ -21,6 +21,44 @@ export class InventoryController {
     private readonly redisService: RedisService,
   ) {}
 
+  @Post('reduce-stock-redis-lock')
+  async reduceStockRedisLock(@Body() reduceStockDto: ReduceStockDto) {
+    return this.inventoryService.reduceStockRedisLock(
+      reduceStockDto.productId,
+      reduceStockDto.quantity,
+    );
+  }
+
+  // 동시 테스트 - redis lock
+  @Post('test/reduce-stock-redis-lock')
+  async testReduceStockRedisLock(
+    @Body() dto: { productId: number; quantity: number; requestCount: number },
+  ) {
+    this.logger.debug(`동시성 테스트 시작: ${JSON.stringify(dto, null, 2)}`);
+    const promiseAll = await Promise.all(
+      Array.from({ length: dto.requestCount }).map(async (_, index) => {
+        try {
+          return await this.reduceStockRedisLock(dto);
+        } catch (error) {
+          return {
+            success: false,
+            message: error?.message || 'Unknown Error',
+          };
+        }
+      }),
+    );
+
+    const failedJob = promiseAll.filter((pred) => !pred.success);
+    const failedCount = failedJob.length;
+    const successCount = promiseAll.length - failedCount;
+    const failedMessages = failedJob.map((val) => val.message);
+    return {
+      successCount,
+      failedCount,
+      failedMessages,
+    };
+  }
+
   @Post('reduce-stock')
   async reduceStock(@Body() reduceStockDto: ReduceStockDto) {
     this.logger.log(`재고 감소 요청: ${JSON.stringify(reduceStockDto)}`);
