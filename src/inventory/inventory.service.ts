@@ -4,6 +4,7 @@ import { InventoryRepository } from '../database/inventory.repository';
 import { randomUUID } from 'crypto';
 import { RedisService } from '@liaoliaots/nestjs-redis';
 import Redis from 'ioredis';
+import { ConfigService } from '@nestjs/config';
 
 @Injectable()
 export class InventoryService {
@@ -13,6 +14,7 @@ export class InventoryService {
   constructor(
     private readonly inventoryRepository: InventoryRepository,
     private readonly redisService: RedisService,
+    private readonly configService: ConfigService,
   ) {
     this.lockRedis = this.redisService.getOrThrow('lock');
   }
@@ -121,35 +123,56 @@ export class InventoryService {
   async reduceStockRedisLock(
     productId: number,
     quantity: number,
-    maxRetries: number = 3,
+    options?: {
+      maxRetries?: number;
+      lockTtl?: number;
+      retryDelay?: number;
+    },
   ): Promise<{
     success: boolean;
     message: string;
     finalStock?: number;
-    duration: number;
+    metrics: {
+      lockAcquisitionTime: number;
+      totalRetries: number;
+      businessLogicTime: number;
+    };
   }> {
     this.logger.debug(
       `재고 감소 요청(redisLock) productId:${productId}, quantity:${quantity}`,
     );
-    const startTime = Date.now();
+    const businessLogicStartTime = Date.now();
+    const {
+      maxRetries = this.configService.get<number>('LOCK_MAX_RETRIES', 3),
+      lockTtl = this.configService.get<number>('LOCK_TTL', 5000),
+      retryDelay = this.configService.get<number>('LOCK_RETRY_DELAY', 100),
+    } = options || {};
+    const metrics = {
+      lockAcquisitionTime: 0,
+      totalRetries: 0,
+      businessLogicTime: 0,
+    };
+    let totalLockAcquisitionTime = 0;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const lockKey = 'product-lock:' + productId;
       const lockValue = randomUUID();
       let lockAcquired: 'OK' | null = null;
+      let lockAcquisitionStartTime: number | null = null;
       try {
         // 레디스 락 획득
         lockAcquired = await this.lockRedis.set(
           lockKey,
           lockValue,
           'PX',
-          5000,
+          lockTtl,
           'NX',
         );
         if (lockAcquired) {
           this.logger.debug(
             `분산락 획득 성공: (LockKey: ${lockKey}, LockValue: ${lockValue})`,
           );
+          lockAcquisitionStartTime = Date.now();
         } else {
           throw new Error(`다른 트랜잭션이 작업 중입니다.`);
         }
@@ -160,14 +183,28 @@ export class InventoryService {
           return {
             success: false,
             message: `제품을 확인할 수 없습니다. (productId:${productId})`,
-            duration: Date.now() - startTime,
+            metrics: {
+              lockAcquisitionTime:
+                totalLockAcquisitionTime +
+                Date.now() -
+                lockAcquisitionStartTime,
+              totalRetries: attempt,
+              businessLogicTime: Date.now() - businessLogicStartTime,
+            },
           };
         }
         if (quantity > product.stock) {
           return {
             success: false,
             message: `재고 부족: 요청 수량(${quantity}), 보유 수량(${product.stock})`,
-            duration: Date.now() - startTime,
+            metrics: {
+              lockAcquisitionTime:
+                totalLockAcquisitionTime +
+                Date.now() -
+                lockAcquisitionStartTime,
+              totalRetries: attempt,
+              businessLogicTime: Date.now() - businessLogicStartTime,
+            },
           };
         }
 
@@ -180,7 +217,12 @@ export class InventoryService {
           success: true,
           message: '재고 감소 성공',
           finalStock: updatedProduct.stock,
-          duration: Date.now() - startTime,
+          metrics: {
+            lockAcquisitionTime:
+              totalLockAcquisitionTime + Date.now() - lockAcquisitionStartTime,
+            totalRetries: attempt,
+            businessLogicTime: Date.now() - businessLogicStartTime,
+          },
         };
       } catch (error) {
         // 예상된 오류로 재시도 조건
@@ -206,14 +248,19 @@ export class InventoryService {
           }
 
           this.logger.debug(`재고 감소 재요청(${attempt}/${maxRetries})`);
-          await this.sleep(Math.random() * 100 + 50);
+          await this.sleep(Math.random() * 50 + retryDelay);
           continue;
         }
 
         // 예상되지 않는 예외 사항은 재시도 하지 않는다.
         throw error;
       } finally {
-        if (lockAcquired) this.releaseLock(lockKey, lockValue);
+        if (lockAcquired) {
+          this.releaseLock(lockKey, lockValue);
+        }
+        if (lockAcquisitionStartTime) {
+          totalLockAcquisitionTime += Date.now() - lockAcquisitionStartTime;
+        }
       }
     }
 
@@ -221,7 +268,11 @@ export class InventoryService {
     return {
       success: false,
       message: '재고 감소 최종 실패: 모든 재시도 횟수 소진',
-      duration: Date.now() - startTime,
+      metrics: {
+        lockAcquisitionTime: totalLockAcquisitionTime,
+        totalRetries: maxRetries,
+        businessLogicTime: Date.now() - businessLogicStartTime,
+      },
     };
   }
 

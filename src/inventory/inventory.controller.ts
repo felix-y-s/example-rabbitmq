@@ -52,10 +52,12 @@ export class InventoryController {
     const failedCount = failedJob.length;
     const successCount = promiseAll.length - failedCount;
     const failedMessages = failedJob.map((val) => val.message);
+
     return {
       successCount,
       failedCount,
       failedMessages,
+      jobs: promiseAll,
     };
   }
 
