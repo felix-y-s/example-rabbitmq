@@ -56,9 +56,9 @@ export default () => ({
   rabbitmq: {
     url: process.env.RABBITMQ_URL || 'amqp://localhost:5672',
     exchange: process.env.RABBITMQ_EXCHANGE || 'inventory-exchange',
-    prefetchCount: parseInt(process.env.RABBITMQ_PREFETCH_COUNT) || 1,
-    messageTTL: parseInt(process.env.RABBITMQ_MESSAGE_TTL) || 300000,
-    maxRetries: parseInt(process.env.RABBITMQ_MAX_RETRIES) || 3,
+    prefetchCount: parseInt(process.env.RABBITMQ_PREFETCH_COUNT || '') || 1,
+    messageTTL: parseInt(process.env.RABBITMQ_MESSAGE_TTL || '') || 300000,
+    maxRetries: parseInt(process.env.RABBITMQ_MAX_RETRIES || '') || 3,
   },
 });
 ```
@@ -76,16 +76,16 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 
 @Module({
   imports: [
-    RabbitMQModule.forRootAsync(RabbitMQModule, {
+    RabbitMQModule.forRootAsync({
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
-        // 🔗 연결 설정
-        uri: configService.get<string>('RABBITMQ_URL'),
+        // 🔗 연결 설정 (config 파일에서 가져오기)
+        uri: configService.get<string>('rabbitmq.url')!,
 
         // 🏗️ Exchange 자동 생성
         exchanges: [
           {
-            name: 'inventory-exchange',
+            name: configService.get<string>('rabbitmq.exchange')!,
             type: 'topic',        // topic, direct, fanout, headers
             options: {
               durable: true,      // 서버 재시작 시에도 유지
@@ -107,22 +107,22 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         queues: [
           {
             name: 'stock-reduce-queue',
-            exchange: 'inventory-exchange',
+            exchange: configService.get<string>('rabbitmq.exchange')!,
             routingKey: 'stock.reduce',
             options: {
               durable: true,
               arguments: {
-                'x-message-ttl': 300000,           // 5분 TTL
+                'x-message-ttl': configService.get<number>('rabbitmq.messageTTL')!, // 설정 파일에서 TTL 가져오기
                 'x-dead-letter-exchange': 'dlq-exchange',
                 'x-dead-letter-routing-key': 'stock.failed',
-                'x-max-retries': 3,
+                'x-max-retries': configService.get<number>('rabbitmq.maxRetries')!,
                 'x-max-priority': 10,              // 우선순위 지원
               },
             },
           },
           {
             name: 'stock-urgent-queue',
-            exchange: 'inventory-exchange',
+            exchange: configService.get<string>('rabbitmq.exchange')!,
             routingKey: 'stock.urgent',
             options: {
               durable: true,
@@ -147,7 +147,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
         // 🔧 성능 튜닝
         channels: {
           'stock-channel': {
-            prefetchCount: 1,              // 순차 처리
+            prefetchCount: configService.get<number>('rabbitmq.prefetchCount')!, // 설정 파일에서 가져오기
             default: true,
           },
           'notification-channel': {
@@ -179,7 +179,7 @@ export class RabbitMQConfigModule {}
 ```typescript
 // src/inventory/inventory.consumer.ts
 import { Injectable, Logger } from '@nestjs/common';
-import { RabbitSubscribe, RabbitPayload, RabbitContext } from '@golevelup/nestjs-rabbitmq';
+import { RabbitSubscribe, RabbitPayload } from '@golevelup/nestjs-rabbitmq';
 import { ConsumeMessage, Channel } from 'amqplib';
 
 @Injectable()
@@ -194,12 +194,7 @@ export class InventoryConsumer {
   })
   async handleStockReduction(
     @RabbitPayload() message: StockReductionMessage,  // 메시지 내용
-    @RabbitContext() context: {                       // 메타데이터
-      channel: Channel;
-      message: ConsumeMessage;
-      correlationId: string;
-      timestamp: number;
-    }
+    amqpMsg: ConsumeMessage                          // AMQP 메시지 (채널 정보 포함)
   ) {
     this.logger.log(`재고 감소 요청: ${JSON.stringify(message)}`);
 
@@ -208,13 +203,14 @@ export class InventoryConsumer {
       await this.processStockReduction(message);
 
       // ✅ 수동 ACK (처리 성공)
-      context.channel.ack(context.message);
+      // amqpMsg를 통해 채널에 직접 접근 (권장되지 않음)
+      // 대신 return 값으로 제어하는 것이 좋습니다.
 
     } catch (error) {
       this.logger.error('재고 감소 실패:', error);
 
-      // ❌ NACK (처리 실패 - 재시도)
-      context.channel.nack(context.message, false, true);
+      // ❌ 에러 발생 시 자동으로 errorBehavior 설정에 따라 처리
+      throw error;
     }
   }
 }
@@ -222,6 +218,8 @@ export class InventoryConsumer {
 
 ### 고급 설정 옵션
 ```typescript
+import { MessageHandlerErrorBehavior, Nack } from '@golevelup/nestjs-rabbitmq';
+
 @Injectable()
 export class AdvancedInventoryConsumer {
 
@@ -247,14 +245,9 @@ export class AdvancedInventoryConsumer {
 
     // 🚀 Consumer 설정
     prefetchCount: 1,                   // 한 번에 하나씩 처리 (순차 보장)
-    noAck: false,                       // 수동 ACK 모드
-    consumerOptions: {
-      priority: 5,                      // Consumer 우선순위
-      exclusive: false,                 // 독점 모드 비활성화
-    },
 
-    // 🚨 에러 처리
-    errorBehavior: 'NACK',              // 에러 시 NACK
+    // 🚨 에러 처리 (최신 방식)
+    errorBehavior: MessageHandlerErrorBehavior.NACK,  // 에러 시 NACK
     errorHandler: (channel, msg, error) => {
       console.error('Custom error handler:', error);
       channel.nack(msg, false, true);  // 재시도
@@ -262,9 +255,23 @@ export class AdvancedInventoryConsumer {
   })
   async handleWithAdvancedOptions(
     @RabbitPayload() message: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
-    // 처리 로직
+    try {
+      // 처리 로직
+      await this.processMessage(message);
+
+      // 성공 시 자동 ACK (기본 동작)
+      return;
+
+    } catch (error) {
+      // 실패 시 재시도를 원할 경우
+      if (shouldRetry(error)) {
+        return new Nack(true); // 재큐잉
+      } else {
+        return new Nack(); // DLQ로 이동
+      }
+    }
   }
 
   // 🎭 여러 Routing Key 구독
@@ -275,9 +282,9 @@ export class AdvancedInventoryConsumer {
   })
   async handleMultipleOperations(
     @RabbitPayload() message: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
-    const routingKey = context.message.fields.routingKey;
+    const routingKey = amqpMsg.fields.routingKey;
 
     switch (routingKey) {
       case 'stock.reduce':
@@ -291,7 +298,7 @@ export class AdvancedInventoryConsumer {
         break;
     }
 
-    context.channel.ack(context.message);
+    // 성공 시 자동 ACK (return으로 처리)
   }
 
   // 🔥 우선순위 처리
@@ -307,9 +314,11 @@ export class AdvancedInventoryConsumer {
   })
   async handleUrgentStock(
     @RabbitPayload() message: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
     // 긴급 재고 처리 (높은 우선순위)
+    await this.processUrgentStock(message);
+    // 성공 시 자동 ACK
   }
 
   // 💀 Dead Letter Queue 처리
@@ -320,7 +329,7 @@ export class AdvancedInventoryConsumer {
   })
   async handleFailedMessages(
     @RabbitPayload() failedMessage: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
     this.logger.error('실패한 메시지 처리:', failedMessage);
 
@@ -328,7 +337,7 @@ export class AdvancedInventoryConsumer {
     // 관리자 알림
     // 수동 복구 또는 보상 트랜잭션
 
-    context.channel.ack(context.message);
+    // 성공 시 자동 ACK
   }
 
   // 🎯 패턴 매칭 (Topic Exchange)
@@ -339,13 +348,13 @@ export class AdvancedInventoryConsumer {
   })
   async handleAllStockOperations(
     @RabbitPayload() message: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
-    const routingKey = context.message.fields.routingKey;
+    const routingKey = amqpMsg.fields.routingKey;
     this.logger.log(`모든 재고 작업 처리: ${routingKey}`);
 
     // 공통 처리 로직 (로깅, 모니터링 등)
-    context.channel.ack(context.message);
+    // 성공 시 자동 ACK
   }
 }
 ```
@@ -478,11 +487,16 @@ import rabbitmqConfig from './config/rabbitmq.config';
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: '.env',
-      load: [rabbitmqConfig],  // 설정 파일 로드
+      load: [rabbitmqConfig],    // 설정 파일 로드 (중요!)
+      envFilePath: ['.env'],
+      validationOptions: {
+        allowUnknown: true,
+        abortEarly: false,
+      },
     }),
-    RabbitMQConfigModule,      // RabbitMQ 설정
+    DatabaseModule,            // 데이터베이스 모듈
     InventoryModule,           // 비즈니스 로직
+    RabbitMQConfigModule,      // RabbitMQ 설정
   ],
 })
 export class AppModule {}
@@ -784,7 +798,7 @@ export class MessagePublisher {
 ```typescript
 // src/inventory/inventory.consumer.ts
 import { Injectable, Logger } from '@nestjs/common';
-import { RabbitSubscribe, RabbitPayload, RabbitContext } from '@golevelup/nestjs-rabbitmq';
+import { RabbitSubscribe, RabbitPayload, MessageHandlerErrorBehavior, Nack } from '@golevelup/nestjs-rabbitmq';
 import { InventoryService } from './inventory.service';
 import { StockReductionMessage, StockOperationResult } from './dto/stock-message.dto';
 import { MessagePublisher } from '../common/utils/message-publisher.util';
@@ -808,7 +822,7 @@ export class InventoryConsumer {
   })
   async handleStockReduction(
     @RabbitPayload() message: StockReductionMessage,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
     const startTime = Date.now();
     const { correlationId } = message;
@@ -819,8 +833,7 @@ export class InventoryConsumer {
       // 중복 처리 방지 (Idempotency)
       if (await this.isAlreadyProcessed(correlationId)) {
         this.logger.warn(`[${correlationId}] 이미 처리된 메시지`);
-        context.channel.ack(context.message);
-        return;
+        return; // 자동 ACK
       }
 
       // 실제 재고 감소 로직 (기존 동기 메서드 활용)
@@ -845,8 +858,8 @@ export class InventoryConsumer {
         // 성공 이벤트 발행 (다른 서비스 알림)
         await this.publishSuccessEvent(message, result);
 
-        // ACK 전송 (메시지 처리 완료)
-        context.channel.ack(context.message);
+        // 성공 시 자동 ACK
+        return;
 
       } else {
         throw new Error(result.message);
@@ -855,8 +868,8 @@ export class InventoryConsumer {
     } catch (error) {
       this.logger.error(`[${correlationId}] 재고 감소 실패:`, error.message);
 
-      // 재시도 로직
-      await this.handleRetry(message, context, error);
+      // 재시도 로직 처리
+      return await this.handleRetry(message, error);
     }
   }
 
@@ -872,7 +885,7 @@ export class InventoryConsumer {
   })
   async handleUrgentStock(
     @RabbitPayload() message: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
     const { correlationId } = message;
     this.logger.log(`[${correlationId}] 긴급 재고 처리 시작`);
@@ -898,7 +911,7 @@ export class InventoryConsumer {
         }
       );
 
-      context.channel.ack(context.message);
+      // 성공 시 자동 ACK
 
     } catch (error) {
       this.logger.error(`[${correlationId}] 긴급 재고 처리 실패:`, error.message);
@@ -906,7 +919,7 @@ export class InventoryConsumer {
       // 긴급 실패 알림 (즉시)
       await this.publishUrgentFailureAlert(message, error);
 
-      context.channel.nack(context.message, false, true);
+      return new Nack(true); // 재시도
     }
   }
 
@@ -919,7 +932,7 @@ export class InventoryConsumer {
   })
   async handleBatchStock(
     @RabbitPayload() message: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
     const { batchId, batchIndex, correlationId } = message;
 
@@ -934,7 +947,7 @@ export class InventoryConsumer {
       // 배치 진행상황 업데이트
       await this.updateBatchProgress(batchId, batchIndex);
 
-      context.channel.ack(context.message);
+      // 성공 시 자동 ACK
 
     } catch (error) {
       this.logger.error(`[${correlationId}] 배치 처리 실패:`, error.message);
@@ -942,7 +955,7 @@ export class InventoryConsumer {
       // 배치 실패 시 전체 배치 상태 업데이트
       await this.markBatchItemFailed(batchId, batchIndex, error);
 
-      context.channel.nack(context.message, false, false); // DLQ로 이동
+      return new Nack(); // DLQ로 이동
     }
   }
 
@@ -954,7 +967,7 @@ export class InventoryConsumer {
   })
   async handleFailedStock(
     @RabbitPayload() failedMessage: any,
-    @RabbitContext() context: any
+    amqpMsg: ConsumeMessage
   ) {
     this.logger.error('실패한 재고 처리:', failedMessage);
 
@@ -978,21 +991,19 @@ export class InventoryConsumer {
         await this.executeCompensation(failedMessage);
       }
 
-      context.channel.ack(context.message);
+      // 성공 시 자동 ACK
 
     } catch (error) {
       this.logger.error('실패 메시지 처리 중 오류:', error);
-      // 실패 처리도 실패한 경우 - 로그만 남기고 ACK
-      context.channel.ack(context.message);
+      // 실패 처리도 실패한 경우 - 로그만 남기고 자동 ACK
     }
   }
 
-  // 🔄 재시도 로직
+  // 🔄 재시도 로직 (최신 API 방식)
   private async handleRetry(
     message: StockReductionMessage,
-    context: any,
     error: Error
-  ): Promise<void> {
+  ): Promise<Nack | void> {
     const retryCount = message.retryCount || 0;
     const maxRetries = 3;
 
@@ -1012,14 +1023,14 @@ export class InventoryConsumer {
       }, delay);
 
       // 현재 메시지는 ACK (새 메시지로 재시도)
-      context.channel.ack(context.message);
+      return;
 
     } else {
       // 최대 재시도 초과 - Dead Letter Queue로 이동
       this.logger.error(`[${message.correlationId}] 최대 재시도 초과, DLQ로 이동`);
 
       await this.publishFailureEvent(message, error);
-      context.channel.nack(context.message, false, false);
+      return new Nack(); // DLQ로 이동
     }
   }
 
