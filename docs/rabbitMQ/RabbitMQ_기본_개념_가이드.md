@@ -221,7 +221,7 @@ export class OrderConsumer {
     routingKey: 'order.created',
     queue: 'order-processing-queue',
     queueOptions: {
-      durable: true,        // 서버 재시작 시에도 큐 유지 // NOTE: 여기서도 durable? module에도 있어
+      durable: true,        // 서버 재시작 시에도 큐 유지 
       arguments: {
         'x-message-ttl': 60000,  // 메시지 TTL (60초)
       }
