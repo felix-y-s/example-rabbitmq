@@ -686,7 +686,7 @@ export class InventoryService {
 
   // 🔄 재시도 메시지 발송
   async republishMessage(
-    originalMessage: StockReductionMessage,
+    originalMessage: **StockReductionMessage**,
     delay: number = 0
   ): Promise<void> {
     const retryMessage = {
@@ -832,7 +832,7 @@ export class InventoryConsumer {
     try {
       // 중복 처리 방지 (Idempotency)
       if (await this.isAlreadyProcessed(correlationId)) {
-        this.logger.warn(`[${correlationId}] 이미 처리된 메시지`);
+        this.logger.warn(`****[${correlationId}] 이미 처리된 메시지`);
         return; // 자동 ACK
       }
 
