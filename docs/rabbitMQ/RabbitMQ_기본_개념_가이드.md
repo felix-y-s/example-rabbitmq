@@ -458,4 +458,396 @@ export interface NotificationEvent {
 }
 ```
 
-이제 Exchange와 큐 설정, DLQ 구성, 환경 설정 등 NestJS에서 RabbitMQ를 완전히 활용하는 방법을 모두 포함했습니다. 이 가이드를 통해 실제 프로덕션 환경에서 사용할 수 있는 안정적인 메시지 큐 시스템을 구축할 수 있습니다.
+
+## 여러 컨슈머와 큐 설정 전략
+
+### 큐 설정 방식 비교
+
+#### 1. Consumer에서 큐 설정 (권장 방식)
+각 컨슈머가 자신이 사용할 큐를 직접 정의하는 방식입니다.
+
+```typescript
+@Injectable()
+export class OrderEmailService {
+  @RabbitSubscribe({
+    exchange: 'order-exchange',
+    routingKey: 'order.created',
+    queue: 'order-processing-queue',
+    queueOptions: {
+      durable: true,
+      arguments: {
+        'x-message-ttl': 60000,
+      }
+    }
+  })
+  async handleOrderEmail(message: any) {
+    console.log('이메일 발송 처리:', message);
+  }
+}
+```
+
+**장점:**
+- 큐와 컨슈머가 함께 정의되어 응집도가 높음
+- 각 컨슈머가 필요한 큐 설정을 직접 관리
+- 코드가 더 명확하고 읽기 쉬움
+
+#### 2. 모듈에서 큐 미리 설정
+여러 컨슈머가 같은 큐를 사용할 때 유용합니다.
+
+```typescript
+// app.module.ts
+@Module({
+  imports: [
+    RabbitMQModule.forRoot(RabbitMQModule, {
+      exchanges: [
+        {
+          name: 'order-exchange',
+          type: 'topic',
+        },
+      ],
+      queues: [
+        {
+          name: 'order-processing-queue',
+          options: {
+            durable: true,
+            arguments: {
+              'x-message-ttl': 60000,
+            }
+          }
+        }
+      ],
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+**언제 사용하나요?**
+- 여러 컨슈머가 같은 큐를 사용할 때
+- 큐 설정이 복잡하고 중앙 관리가 필요할 때
+- 애플리케이션 시작 시 큐가 미리 생성되어야 할 때
+
+### 여러 컨슈머의 큐 사용 패턴
+
+#### 패턴 1: 같은 큐 사용 (로드 밸런싱)
+**동일한 작업을 여러 인스턴스가 나눠서 처리**하여 성능을 향상시키는 방식입니다.
+
+```typescript
+// 동일한 코드가 여러 서버 인스턴스에서 실행됨
+@Injectable()
+export class OrderProcessingService {
+  @RabbitSubscribe({
+    exchange: 'order-exchange',
+    routingKey: 'order.created',
+    queue: 'order-processing-queue', // 같은 큐 사용
+  })
+  async handleOrderProcessing(message: any) {
+    const serverId = process.env.SERVER_ID || 'unknown';
+    console.log(`서버 ${serverId}에서 주문 처리:`, message);
+
+    // 동일한 로직: 재고 차감 → 결제 → 이메일 → 알림
+    await this.processCompleteOrder(message);
+  }
+
+  private async processCompleteOrder(orderData: any) {
+    // 재고 차감
+    await this.inventoryService.decreaseStock(orderData.items);
+
+    // 결제 처리
+    await this.paymentService.processPayment(orderData.orderId);
+
+    // 이메일 발송
+    await this.emailService.sendOrderConfirmation(orderData.customerId);
+
+    // 알림 발송
+    await this.notificationService.sendPushNotification(orderData.customerId);
+  }
+}
+```
+
+**실제 배포 구조:**
+```bash
+# 서버 1에서 실행
+SERVER_ID=1 npm run start
+
+# 서버 2에서 실행
+SERVER_ID=2 npm run start
+
+# 서버 3에서 실행
+SERVER_ID=3 npm run start
+```
+
+**메시지 처리 방식:**
+- 메시지 1개 발송 → 3개 인스턴스 중 **1개만** 처리
+- 순환(Round-Robin) 방식으로 분배
+- 로드 밸런싱 효과 (부하 분산)
+
+```typescript
+// 주문 생성 서비스
+@Injectable()
+export class OrderService {
+  constructor(private readonly amqpConnection: AmqpConnection) {}
+
+  async createOrder(orderData: any) {
+    // 메시지 발송 - 3개 인스턴스 중 하나가 받아서 처리
+    await this.amqpConnection.publish(
+      'order-exchange',
+      'order.created',
+      orderData
+    );
+  }
+}
+```
+
+**실행 결과 예시:**
+```bash
+# 주문 1: 서버 1에서 주문 처리: { orderId: 1 }
+# 주문 2: 서버 2에서 주문 처리: { orderId: 2 }
+# 주문 3: 서버 3에서 주문 처리: { orderId: 3 }
+# 주문 4: 서버 1에서 주문 처리: { orderId: 4 } (다시 순환)
+```
+
+**실제 사용 사례:**
+- **수평 확장(Scale-Out)**: 동일한 애플리케이션을 여러 서버에서 실행
+- **트래픽 분산**: 많은 주문이 들어와도 여러 서버가 나눠서 처리
+- **고가용성**: 한 서버가 다운되어도 다른 서버가 계속 처리
+- **Docker/Kubernetes**: 컨테이너 환경에서 Pod 복제를 통한 로드 밸런싱
+
+```bash
+# Docker Compose 예시
+version: '3.8'
+services:
+  order-service-1:
+    image: order-service:latest
+    environment:
+      - SERVER_ID=1
+      - RABBITMQ_URI=amqp://rabbitmq:5672
+
+  order-service-2:
+    image: order-service:latest
+    environment:
+      - SERVER_ID=2
+      - RABBITMQ_URI=amqp://rabbitmq:5672
+
+  order-service-3:
+    image: order-service:latest
+    environment:
+      - SERVER_ID=3
+      - RABBITMQ_URI=amqp://rabbitmq:5672
+```
+```
+
+#### 패턴 2: 각각 다른 큐 사용 (브로드캐스트)
+모든 컨슈머가 메시지를 받아서 처리해야 하는 경우입니다.
+
+```typescript
+// 이메일 서비스
+@Injectable()
+export class OrderEmailService {
+  @RabbitSubscribe({
+    exchange: 'order-exchange',
+    routingKey: 'order.created',
+    queue: 'order-email-queue', // 전용 큐
+  })
+  async handleOrderEmail(message: any) {
+    console.log('이메일 발송 처리:', message);
+  }
+}
+
+// 재고 서비스
+@Injectable()
+export class OrderInventoryService {
+  @RabbitSubscribe({
+    exchange: 'order-exchange',
+    routingKey: 'order.created',
+    queue: 'order-inventory-queue', // 전용 큐
+  })
+  async handleOrderInventory(message: any) {
+    console.log('재고 업데이트 처리:', message);
+  }
+}
+
+// 알림 서비스
+@Injectable()
+export class OrderNotificationService {
+  @RabbitSubscribe({
+    exchange: 'order-exchange',
+    routingKey: 'order.created',
+    queue: 'order-notification-queue', // 전용 큐
+  })
+  async handleOrderNotification(message: any) {
+    console.log('알림 발송 처리:', message);
+  }
+}
+```
+
+**메시지 처리 방식:**
+- 메시지 1개 발송 → **3개 컨슈머 모두** 처리
+- 브로드캐스트 효과
+
+## 브로드캐스트 구현 방법
+
+### 방법 1: Fanout Exchange 사용
+
+#### Exchange 설정
+```typescript
+// app.module.ts
+@Module({
+  imports: [
+    RabbitMQModule.forRoot(RabbitMQModule, {
+      exchanges: [
+        {
+          name: 'order-broadcast-exchange',
+          type: 'fanout', // 브로드캐스트용 타입
+        },
+      ],
+      uri: 'amqp://localhost:5672',
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+#### 컨슈머 설정
+```typescript
+// 이메일 서비스
+@Injectable()
+export class OrderEmailService {
+  @RabbitSubscribe({
+    exchange: 'order-broadcast-exchange',
+    routingKey: '', // fanout은 라우팅키 무시
+    queue: 'email-queue',
+    queueOptions: {
+      durable: true,
+    }
+  })
+  async handleOrderEmail(message: any) {
+    console.log('📧 이메일 발송:', message);
+  }
+}
+
+// 재고 서비스
+@Injectable()
+export class OrderInventoryService {
+  @RabbitSubscribe({
+    exchange: 'order-broadcast-exchange',
+    routingKey: '',
+    queue: 'inventory-queue',
+    queueOptions: {
+      durable: true,
+    }
+  })
+  async handleOrderInventory(message: any) {
+    console.log('📦 재고 업데이트:', message);
+  }
+}
+
+// 알림 서비스
+@Injectable()
+export class OrderNotificationService {
+  @RabbitSubscribe({
+    exchange: 'order-broadcast-exchange',
+    routingKey: '',
+    queue: 'notification-queue',
+    queueOptions: {
+      durable: true,
+    }
+  })
+  async handleOrderNotification(message: any) {
+    console.log('🔔 알림 발송:', message);
+  }
+}
+```
+
+#### 브로드캐스트 메시지 발송
+```typescript
+// 주문 서비스
+@Injectable()
+export class OrderService {
+  constructor(private readonly amqpConnection: AmqpConnection) {}
+
+  async createOrder(orderData: any) {
+    // 주문 생성 로직
+    const order = { id: 1, ...orderData };
+
+    // 브로드캐스트 발송 - 모든 컨슈머가 받음
+    await this.amqpConnection.publish(
+      'order-broadcast-exchange',
+      '', // fanout은 라우팅키가 필요 없음
+      order
+    );
+
+    console.log('✅ 주문 생성 완료 - 모든 서비스에 알림 발송');
+  }
+}
+```
+
+#### 실행 결과
+```bash
+# 메시지 1개 발송 시
+✅ 주문 생성 완료 - 모든 서비스에 알림 발송
+📧 이메일 발송: { id: 1, userId: 123, amount: 50000 }
+📦 재고 업데이트: { id: 1, userId: 123, amount: 50000 }
+🔔 알림 발송: { id: 1, userId: 123, amount: 50000 }
+```
+
+### 방법 2: Topic Exchange 사용 (더 유연한 방식)
+
+세밀한 제어가 필요한 경우 Topic Exchange를 사용할 수 있습니다.
+
+```typescript
+// 모듈 설정
+@Module({
+  imports: [
+    RabbitMQModule.forRoot(RabbitMQModule, {
+      exchanges: [
+        {
+          name: 'order-topic-exchange',
+          type: 'topic',
+        },
+      ],
+    }),
+  ],
+})
+```
+
+```typescript
+// 각 서비스에서 같은 라우팅키 사용
+@RabbitSubscribe({
+  exchange: 'order-topic-exchange',
+  routingKey: 'order.created', // 같은 라우팅키
+  queue: 'email-queue', // 다른 큐
+})
+
+@RabbitSubscribe({
+  exchange: 'order-topic-exchange',
+  routingKey: 'order.created', // 같은 라우팅키
+  queue: 'inventory-queue', // 다른 큐
+})
+
+// 발송
+await this.amqpConnection.publish(
+  'order-topic-exchange',
+  'order.created',
+  order
+);
+```
+
+### 패턴 선택 가이드
+
+| 상황 | 큐 사용 방식 | Exchange 타입 | 용도 |
+|------|-------------|---------------|------|
+| 작업 분산 처리 | 같은 큐 | Direct/Topic | 로드 밸런싱 |
+| 모든 서비스 처리 | 다른 큐 | Fanout | 브로드캐스트 |
+| 조건부 브로드캐스트 | 다른 큐 | Topic | 선택적 브로드캐스트 |
+
+### 핵심 포인트
+
+- **Fanout Exchange**: 무조건 모든 큐에 메시지 전송
+- **다른 큐 이름**: 각 컨슈머마다 고유한 큐 사용
+- **라우팅키**: Fanout은 무시, Topic은 동일하게 설정
+- **결과**: 메시지 1개 → 모든 컨슈머가 처리
+
+**결론:**
+- **같은 큐 사용** = 메시지를 나눠서 처리 (로드 밸런싱)
+- **다른 큐 사용** = 모든 컨슈머가 메시지를 받아서 처리 (브로드캐스트)
