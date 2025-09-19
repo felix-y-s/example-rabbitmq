@@ -3,13 +3,17 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { InventoryModule } from './inventory/inventory.module';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import rabbitmqConfig from './config/rabbitmq.config';
 import { DatabaseModule } from './database/database.module';
 import { RedisModule } from '@liaoliaots/nestjs-redis';
+import { OrderModule } from './order/order.module';
 
 @Module({
   imports: [
+    OrderModule,
     ConfigModule.forRoot({
       isGlobal: true,
+      load: [rabbitmqConfig], // 설정 파일 로드
       envFilePath: ['.env'],
       validationOptions: {
         allowUnknown: true, // 설명:
@@ -18,6 +22,7 @@ import { RedisModule } from '@liaoliaots/nestjs-redis';
     }),
     DatabaseModule,
     InventoryModule,
+    // RabbitMQConfigModule,
     RedisModule.forRootAsync({
       useFactory: (configService: ConfigService) => ({
         readyLog: true,
