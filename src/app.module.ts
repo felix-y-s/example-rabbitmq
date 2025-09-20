@@ -5,6 +5,7 @@ import { InventoryModule } from './inventory/inventory.module';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { DatabaseModule } from './database/database.module';
 import { RedisModule } from '@liaoliaots/nestjs-redis';
+import { OrderModule } from './order/order.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { RedisModule } from '@liaoliaots/nestjs-redis';
       }),
       inject: [ConfigService],
     }),
+    OrderModule,
   ],
   controllers: [AppController],
   providers: [AppService],
