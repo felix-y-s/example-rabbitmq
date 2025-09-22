@@ -461,134 +461,447 @@ export class AppController {
 
 **목표**: 실제 비즈니스 시나리오에 적용
 
-### 5.1 주문 생성 플로우
+### 5.1 RabbitMQ 설정 업데이트
+
+먼저 실전 적용을 위해 RabbitMQ 설정을 확장하겠습니다:
 
 ```typescript
-// order.controller.ts (새 파일)
-import { Controller, Post, Body, Inject } from '@nestjs/common';
+// config/rabbitmq.config.ts (업데이트)
+import { Transport, RmqOptions } from '@nestjs/microservices';
+
+// RPC 패턴용 설정 (자동 ACK)
+export const rpcRabbitMQConfig: RmqOptions = {
+  transport: Transport.RMQ,
+  options: {
+    urls: [process.env.RABBITMQ_URL || 'amqp://admin:admin123@localhost:5672'],
+    queue: 'rpc_queue',
+    queueOptions: {
+      durable: true,
+    },
+    socketOptions: {
+      heartbeatIntervalInSeconds: 60,
+      reconnectTimeInSeconds: 5,
+    },
+    exchange: 'app_rpc_exchange',
+    routingKey: 'rpc.#',
+    noAck: true, // RPC는 반드시 자동 ACK
+  },
+};
+
+// 이벤트 패턴용 설정 (수동 ACK)
+export const eventRabbitMQConfig: RmqOptions = {
+  transport: Transport.RMQ,
+  options: {
+    urls: [process.env.RABBITMQ_URL || 'amqp://admin:admin123@localhost:5672'],
+    queue: 'event_queue',
+    queueOptions: {
+      durable: true,
+    },
+    socketOptions: {
+      heartbeatIntervalInSeconds: 60,
+      reconnectTimeInSeconds: 5,
+    },
+    exchange: 'app_events_exchange',
+    routingKey: 'order.#', // 주문 관련 이벤트 수신
+    noAck: false, // 수동 ACK로 안정성 보장
+    prefetchCount: 1, // 한 번에 하나씩 처리
+  },
+};
+
+// 클라이언트 전용 설정
+export const eventClientConfig: RmqOptions = {
+  transport: Transport.RMQ,
+  options: {
+    urls: [process.env.RABBITMQ_URL || 'amqp://admin:admin123@localhost:5672'],
+    socketOptions: {
+      heartbeatIntervalInSeconds: 60,
+      reconnectTimeInSeconds: 5,
+    },
+    exchange: 'app_events_exchange',
+    noAck: true, // 클라이언트는 자동 ACK
+  },
+};
+
+export const rpcClientConfig: RmqOptions = {
+  transport: Transport.RMQ,
+  options: {
+    urls: [process.env.RABBITMQ_URL || 'amqp://admin:admin123@localhost:5672'],
+    queue: 'rpc_queue',
+    queueOptions: {
+      durable: true,
+    },
+    socketOptions: {
+      heartbeatIntervalInSeconds: 60,
+      reconnectTimeInSeconds: 5,
+    },
+    exchange: 'app_rpc_exchange',
+    noAck: true,
+  },
+};
+```
+
+### 5.2 main.ts 마이크로서비스 설정
+
+실전 적용을 위해 main.ts를 업데이트합니다:
+
+```typescript
+// main.ts (업데이트)
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { Logger, ValidationPipe } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { MicroserviceOptions } from '@nestjs/microservices';
+import {
+  rpcRabbitMQConfig,
+  eventRabbitMQConfig,
+} from './config/rabbitmq.config';
+
+async function bootstrap() {
+  const logger = new Logger('Bootstrap');
+
+  const app = await NestFactory.create(AppModule, {
+    logger: ['log', 'error', 'warn', 'debug'],
+  });
+
+  // RPC 패턴용 마이크로서비스 (자동 ACK)
+  app.connectMicroservice<MicroserviceOptions>(rpcRabbitMQConfig);
+
+  // 이벤트 패턴용 마이크로서비스 (수동 ACK)
+  app.connectMicroservice<MicroserviceOptions>(eventRabbitMQConfig);
+
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+      disableErrorMessages: false,
+    }),
+  );
+
+  app.enableCors({
+    origin: true,
+    credentials: true,
+  });
+
+  const configService = app.get(ConfigService);
+  const port = configService.get<number>('PORT', 3000);
+
+  // 마이크로서비스 시작
+  await app.startAllMicroservices();
+  logger.log('🎯 RPC 마이크로서비스 시작됨 (rpc_queue)');
+  logger.log('🎯 이벤트 마이크로서비스 시작됨 (event_queue)');
+
+  // HTTP 서버 시작
+  await app.listen(port);
+
+  logger.log(`🚀 애플리케이션이 포트 ${port}에서 실행 중입니다.`);
+  logger.log(`📊 환경: ${process.env.NODE_ENV || 'development'}`);
+  logger.log(`🐰 RabbitMQ: ${process.env.RABBITMQ_URL || 'amqp://admin:admin123@localhost:5672'}`);
+}
+
+bootstrap().catch((error) => {
+  console.error('부트스트랩 시작 실패:', error);
+  process.exit(1);
+});
+```
+
+### 5.3 주문 시스템 구현
+
+실전에서 사용할 수 있는 완전한 주문 시스템을 구현합니다:
+
+```typescript
+// order.controller.ts (새로 생성)
+import { Body, Controller, Get, Inject, Param, Post } from '@nestjs/common';
 import { ClientProxy } from '@nestjs/microservices';
+import { firstValueFrom, timeout, catchError, throwError } from 'rxjs';
 
 interface CreateOrderDto {
   userId: string;
-  items: Array<{
+  products: Array<{
     productId: string;
     quantity: number;
     price: number;
   }>;
+  shippingAddress: string;
 }
 
 @Controller('orders')
 export class OrderController {
   constructor(
-    @Inject('HELLO_SERVICE') private client: ClientProxy,
+    @Inject('RPC_SERVICE') private rpcClient: ClientProxy,
+    @Inject('EVENT_SERVICE') private eventClient: ClientProxy,
   ) {}
 
   @Post()
   async createOrder(@Body() orderData: CreateOrderDto) {
-    // 1. 주문 데이터 생성
     const order = {
-      id: `order_${Date.now()}`,
+      id: Date.now().toString(),
       ...orderData,
       status: 'pending',
-      totalAmount: orderData.items.reduce((sum, item) => sum + (item.price * item.quantity), 0),
+      totalAmount: orderData.products.reduce((sum, product) =>
+        sum + (product.price * product.quantity), 0
+      ),
       createdAt: new Date(),
     };
 
-    console.log('주문 생성:', order.id);
-
-    // 2. 주문 생성 이벤트 발행 (비동기)
-    this.client.emit('order.created', order);
-
-    return {
-      message: '주문이 접수되었습니다',
-      orderId: order.id,
-    };
-  }
-}
-```
-
-### 5.2 주문 이벤트 처리
-
-```typescript
-// order-handler.controller.ts (새 파일)
-import { Controller } from '@nestjs/common';
-import { EventPattern, Payload, Ctx, RmqContext } from '@nestjs/microservices';
-
-@Controller()
-export class OrderHandlerController {
-  @EventPattern('order.created')
-  async handleOrderCreated(@Payload() order: any, @Ctx() context: RmqContext) {
-    const channel = context.getChannelRef();
-    const originalMessage = context.getMessage();
-
     try {
-      console.log(`주문 처리 시작: ${order.id}`);
+      // 1. 재고 확인 (RPC 패턴 - 즉시 응답 필요)
+      const inventoryCheck = await firstValueFrom(
+        this.rpcClient.send('inventory.check', {
+          products: orderData.products
+        }).pipe(
+          timeout(3000),
+          catchError(err => throwError(() => err))
+        )
+      );
 
-      // 순차적으로 처리
-      await this.validateOrder(order);
-      await this.reserveInventory(order);
-      await this.sendOrderConfirmation(order);
+      if (!inventoryCheck.success) {
+        return {
+          success: false,
+          error: '재고가 부족합니다',
+          details: inventoryCheck.outOfStock
+        };
+      }
 
-      channel.ack(originalMessage);
-      console.log(`주문 처리 완료: ${order.id}`);
+      // 2. 주문 생성 이벤트 발행 (Event 패턴 - 비동기 처리)
+      this.eventClient.emit('order.created', order);
+
+      return {
+        success: true,
+        message: '주문이 생성되었습니다',
+        order: {
+          id: order.id,
+          status: order.status,
+          totalAmount: order.totalAmount
+        }
+      };
 
     } catch (error) {
-      console.error(`주문 처리 실패: ${order.id}`, error.message);
-      channel.nack(originalMessage, false, true);
+      return {
+        success: false,
+        error: '주문 생성 중 오류가 발생했습니다',
+        details: error.message
+      };
     }
   }
 
-  private async validateOrder(order: any) {
-    console.log('주문 유효성 검사:', order.id);
+  @Get(':id/status')
+  async getOrderStatus(@Param('id') orderId: string) {
+    try {
+      const result = await firstValueFrom(
+        this.rpcClient.send('order.status', { orderId }).pipe(
+          timeout(2000),
+          catchError(err => throwError(() => err))
+        )
+      );
 
-    if (order.items.length === 0) {
-      throw new Error('주문 상품이 없습니다');
+      return result;
+    } catch (error) {
+      return {
+        error: '주문 상태 조회 중 오류가 발생했습니다',
+        details: error.message
+      };
     }
-
-    if (order.totalAmount <= 0) {
-      throw new Error('주문 금액이 유효하지 않습니다');
-    }
-  }
-
-  private async reserveInventory(order: any) {
-    console.log('재고 예약:', order.id);
-
-    for (const item of order.items) {
-      console.log(`- 상품 ${item.productId}: ${item.quantity}개 예약`);
-
-      // 재고 부족 시뮬레이션 (20% 확률)
-      if (Math.random() < 0.2) {
-        throw new Error(`상품 ${item.productId}의 재고가 부족합니다`);
-      }
-    }
-  }
-
-  private async sendOrderConfirmation(order: any) {
-    console.log('주문 확인 이메일 발송:', order.id);
-    // 이메일 발송 로직
   }
 }
 ```
 
-### 5.3 모듈 등록
+```typescript
+// order.service.ts (새로 생성)
+import { Controller, Logger } from '@nestjs/common';
+import { Ctx, EventPattern, MessagePattern, Payload, RmqContext } from '@nestjs/microservices';
+
+@Controller()
+export class OrderService {
+  private readonly logger = new Logger(OrderService.name);
+
+  // 가짜 주문 데이터베이스
+  private orders = new Map<string, any>();
+
+  // 가짜 재고 데이터
+  private inventory = new Map([
+    ['product-1', { stock: 10, name: '노트북' }],
+    ['product-2', { stock: 5, name: '마우스' }],
+    ['product-3', { stock: 0, name: '키보드 (품절)' }],
+  ]);
+
+  @MessagePattern('inventory.check')
+  async checkInventory(@Payload() data: { products: any[] }) {
+    this.logger.debug('재고 확인 요청:', data.products);
+
+    const outOfStock = [];
+
+    for (const product of data.products) {
+      const inventoryItem = this.inventory.get(product.productId);
+
+      if (!inventoryItem || inventoryItem.stock < product.quantity) {
+        outOfStock.push({
+          productId: product.productId,
+          requested: product.quantity,
+          available: inventoryItem?.stock || 0
+        });
+      }
+    }
+
+    const success = outOfStock.length === 0;
+
+    // 처리 시간 시뮬레이션
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    return {
+      success,
+      outOfStock: success ? undefined : outOfStock,
+      message: success ? '재고 확인 완료' : '일부 상품 재고 부족'
+    };
+  }
+
+  @MessagePattern('order.status')
+  async getOrderStatus(@Payload() data: { orderId: string }) {
+    this.logger.debug('주문 상태 조회:', data.orderId);
+
+    const order = this.orders.get(data.orderId);
+
+    if (!order) {
+      return {
+        success: false,
+        error: '주문을 찾을 수 없습니다'
+      };
+    }
+
+    return {
+      success: true,
+      data: {
+        id: order.id,
+        status: order.status,
+        totalAmount: order.totalAmount,
+        createdAt: order.createdAt,
+        updatedAt: order.updatedAt
+      }
+    };
+  }
+
+  @EventPattern('order.created')
+  async handleOrderCreated(
+    @Payload() order: any,
+    @Ctx() context: RmqContext,
+  ) {
+    const channel = context.getChannelRef();
+    const originalMessage = context.getMessage();
+    const deliveryTag = originalMessage.fields.deliveryTag;
+
+    try {
+      this.logger.debug(`[주문 처리] 시작 - Order: ${order.id}, DeliveryTag: ${deliveryTag}`);
+
+      // 1. 주문 저장
+      this.orders.set(order.id, {
+        ...order,
+        status: 'processing',
+        updatedAt: new Date()
+      });
+
+      // 2. 재고 차감
+      await this.reduceInventory(order.products);
+
+      // 3. 결제 처리 (시뮬레이션)
+      await this.processPayment(order);
+
+      // 4. 배송 준비
+      await this.prepareShipping(order);
+
+      // 주문 상태 업데이트
+      this.orders.set(order.id, {
+        ...this.orders.get(order.id),
+        status: 'confirmed',
+        updatedAt: new Date()
+      });
+
+      // 성공 시 수동 ACK
+      channel.ack(originalMessage);
+      this.logger.debug(`[주문 처리] 완료 - Order: ${order.id}, DeliveryTag: ${deliveryTag}`);
+
+    } catch (error) {
+      this.logger.error(`[주문 처리] 실패 - Order: ${order.id}, DeliveryTag: ${deliveryTag}`, error.message);
+
+      // 주문 상태를 실패로 업데이트
+      this.orders.set(order.id, {
+        ...this.orders.get(order.id),
+        status: 'failed',
+        error: error.message,
+        updatedAt: new Date()
+      });
+
+      // 실패 시 수동 NACK (재시도 허용)
+      channel.nack(originalMessage, false, true);
+      this.logger.warn(`[주문 처리] NACK 전송 (재시도) - Order: ${order.id}, DeliveryTag: ${deliveryTag}`);
+    }
+  }
+
+  private async reduceInventory(products: any[]) {
+    // 재고 차감 로직 (20% 확률로 실패)
+    if (Math.random() < 0.2) {
+      throw new Error('재고 차감 실패 - 시스템 오류');
+    }
+
+    for (const product of products) {
+      const inventoryItem = this.inventory.get(product.productId);
+      if (inventoryItem) {
+        inventoryItem.stock -= product.quantity;
+      }
+    }
+
+    this.logger.debug('재고 차감 완료');
+  }
+
+  private async processPayment(order: any) {
+    // 결제 처리 로직 (15% 확률로 실패)
+    if (Math.random() < 0.15) {
+      throw new Error('결제 처리 실패 - 카드 승인 거부');
+    }
+
+    // 결제 처리 시간 시뮬레이션
+    await new Promise(resolve => setTimeout(resolve, 200));
+    this.logger.debug(`결제 처리 완료 - 금액: ${order.totalAmount}원`);
+  }
+
+  private async prepareShipping(order: any) {
+    // 배송 준비 로직 (10% 확률로 실패)
+    if (Math.random() < 0.1) {
+      throw new Error('배송 준비 실패 - 배송 시스템 오류');
+    }
+
+    // 배송 준비 시간 시뮬레이션
+    await new Promise(resolve => setTimeout(resolve, 150));
+    this.logger.debug(`배송 준비 완료 - 주소: ${order.shippingAddress}`);
+  }
+}
+```
+
+### 5.4 모듈 업데이트
 
 ```typescript
-// app.module.ts (수정)
+// app.module.ts (업데이트)
 import { Module } from '@nestjs/common';
-import { ClientsModule } from '@nestjs/microservices';
-import { rabbitMQConfig } from './config/rabbitmq.config';
 import { AppController } from './app.controller';
+import { AppService } from './app.service';
 import { MessageController } from './message.controller';
 import { OrderController } from './order.controller';
-import { OrderHandlerController } from './order-handler.controller';
+import { OrderService } from './order.service';
+import { ClientsModule } from '@nestjs/microservices';
+import {
+  rpcClientConfig,
+  eventClientConfig
+} from './config/rabbitmq.config';
 
 @Module({
   imports: [
     ClientsModule.register([
       {
-        name: 'HELLO_SERVICE',
-        transport: rabbitMQConfig.transport,
-        options: rabbitMQConfig.options,
+        name: 'RPC_SERVICE',
+        ...rpcClientConfig,
+      },
+      {
+        name: 'EVENT_SERVICE',
+        ...eventClientConfig,
       },
     ]),
   ],
@@ -596,54 +909,163 @@ import { OrderHandlerController } from './order-handler.controller';
     AppController,
     MessageController,
     OrderController,
-    OrderHandlerController,
+    OrderService
   ],
+  providers: [AppService],
 })
 export class AppModule {}
 ```
 
-### 5.4 테스트해보기
+### 5.5 테스트하기
 
+1. **주문 생성 테스트**:
 ```bash
-# 성공 케이스
 curl -X POST http://localhost:3000/orders \
   -H "Content-Type: application/json" \
   -d '{
-    "userId": "user123",
-    "items": [
-      {"productId": "product1", "quantity": 2, "price": 10000},
-      {"productId": "product2", "quantity": 1, "price": 20000}
-    ]
-  }'
-
-# 실패 케이스 (빈 상품 목록)
-curl -X POST http://localhost:3000/orders \
-  -H "Content-Type: application/json" \
-  -d '{
-    "userId": "user123",
-    "items": []
+    "userId": "user-123",
+    "products": [
+      {
+        "productId": "product-1",
+        "quantity": 2,
+        "price": 10000
+      },
+      {
+        "productId": "product-2",
+        "quantity": 1,
+        "price": 5000
+      }
+    ],
+    "shippingAddress": "서울시 강남구 테헤란로 123"
   }'
 ```
 
-**✅ 5단계 완료!** 실제 비즈니스 로직을 RabbitMQ로 처리할 수 있습니다.
+2. **주문 상태 확인**:
+```bash
+curl http://localhost:3000/orders/{주문ID}/status
+```
+
+3. **재고 부족 테스트**:
+```bash
+curl -X POST http://localhost:3000/orders \
+  -H "Content-Type: application/json" \
+  -d '{
+    "userId": "user-123",
+    "products": [
+      {
+        "productId": "product-3",
+        "quantity": 1,
+        "price": 10000
+      }
+    ],
+    "shippingAddress": "서울시 강남구 테헤란로 123"
+  }'
+```
+
+### 5.6 로그 모니터링
+
+애플리케이션을 실행하고 다음과 같은 로그를 확인할 수 있습니다:
+
+```
+🎯 RPC 마이크로서비스 시작됨 (rpc_queue)
+🎯 이벤트 마이크로서비스 시작됨 (event_queue)
+🚀 애플리케이션이 포트 3000에서 실행 중입니다.
+
+[주문 처리] 시작 - Order: 1703123456789, DeliveryTag: 1
+재고 차감 완료
+결제 처리 완료 - 금액: 25000원
+배송 준비 완료 - 주소: 서울시 강남구 테헤란로 123
+[주문 처리] 완료 - Order: 1703123456789, DeliveryTag: 1
+```
+
+**✅ 5단계 완료!** 실전 주문 시스템에서 RPC와 이벤트 패턴을 조합하여 안정적인 마이크로서비스를 구현했습니다.
 
 ---
 
-## 🎉 완성된 기능들
+## 📚 학습 정리
 
-1. **기본 메시징**: 메시지 발행/소비
-2. **이벤트 처리**: 비동기 이벤트 기반 아키텍처
-3. **RPC 통신**: 동기식 요청-응답
-4. **에러 처리**: 재시도, ACK/NACK 처리
-5. **실전 적용**: 주문 시스템 구현
+이 가이드를 통해 다음을 학습했습니다:
+
+### 1. NestJS 마이크로서비스 기본 구조
+- **Transport 설정**: RabbitMQ 연결 및 큐 설정
+- **패턴 기반 라우팅**: MessagePattern vs EventPattern
+- **클라이언트/서버 분리**: 역할별 설정 구분
+
+### 2. RPC vs Event 패턴 차이점
+| 구분 | RPC 패턴 | Event 패턴 |
+|------|----------|------------|
+| **용도** | 동기 요청-응답 | 비동기 이벤트 처리 |
+| **ACK 설정** | `noAck: true` (자동) | `noAck: false` (수동) |
+| **응답** | 필수 (return 값) | 불필요 |
+| **에러 처리** | 예외 throw | ACK/NACK로 처리 |
+| **사용 예시** | 데이터 조회, 재고 확인 | 주문 처리, 알림 발송 |
+
+### 3. 수동 ACK/NACK를 통한 안정성 보장
+```typescript
+// 성공 시
+channel.ack(originalMessage);
+
+// 실패 시 (재시도)
+channel.nack(originalMessage, false, true);
+```
+
+### 4. 최신 RxJS 패턴 적용
+```typescript
+// ❌ 과거 (deprecated)
+await this.client.send('pattern', data).toPromise();
+
+// ✅ 현재 (권장)
+await firstValueFrom(
+  this.client.send('pattern', data).pipe(
+    timeout(5000),
+    catchError(err => throwError(() => err))
+  )
+);
+```
+
+### 5. 실전 비즈니스 로직 적용
+- **재고 확인**: RPC 패턴으로 즉시 응답
+- **주문 처리**: Event 패턴으로 비동기 처리
+- **에러 복구**: 재시도 로직과 상태 관리
+- **로깅 시스템**: 체계적인 모니터링
+
+## 🎯 핵심 포인트
+
+### ✅ 올바른 패턴 사용
+- **RPC**: `noAck: true`, 즉시 응답 필요한 작업
+- **Event**: `noAck: false`, 안정성이 중요한 작업
+- **큐 분리**: 패턴별로 별도 큐 사용
+
+### ✅ 에러 처리 전략
+- **타임아웃 설정**: 무한 대기 방지
+- **재시도 로직**: NACK를 통한 자동 재시도
+- **상태 관리**: 처리 과정별 상태 추적
+
+### ✅ 최신 기술 스택
+- **RxJS 최신 패턴**: firstValueFrom 사용
+- **TypeScript**: 강타입 인터페이스 정의
+- **구조화된 로깅**: Logger 클래스 활용
 
 ## 🚀 다음 단계
 
 이제 기본기를 마스터했으니 다음과 같은 고급 기능들을 추가해볼 수 있습니다:
 
+### 고급 기능
 - **데드 레터 큐**: 처리 실패한 메시지 관리
-- **서킷 브레이커**: 장애 전파 방지
-- **여러 큐 사용**: 도메인별 큐 분리
-- **모니터링**: 메시지 처리 현황 추적
+- **서킷 브레이커**: 장애 전파 방지 패턴
+- **Exchange 라우팅**: 복잡한 메시지 라우팅
+- **클러스터링**: 다중 인스턴스 운영
 
-각 단계마다 실제로 코드를 작성하고 테스트해보시면서 진행하시면, RabbitMQ의 동작 원리를 확실히 이해할 수 있을 것입니다!
+### 운영 관점
+- **모니터링**: 메시지 처리 현황 추적
+- **성능 최적화**: prefetchCount, 연결 풀링
+- **보안**: 인증/인가, TLS 암호화
+- **백업/복구**: 메시지 지속성, 클러스터 복구
+
+### 실전 적용
+- **마이크로서비스 아키텍처**: 서비스 간 통신
+- **이벤트 소싱**: 이벤트 기반 상태 관리
+- **CQRS 패턴**: 명령과 조회 분리
+- **사가 패턴**: 분산 트랜잭션 관리
+
+각 단계마다 실제로 코드를 작성하고 테스트해보시면서 진행하시면, RabbitMQ와 NestJS 마이크로서비스의 동작 원리를 확실히 이해할 수 있을 것입니다!
